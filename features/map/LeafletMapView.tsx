@@ -42,6 +42,17 @@ type LeafletMarker = {
   title: string;
 };
 
+function isQuestMarker(m: GameMapMarker): boolean {
+  const category = (m.category ?? '').trim().toLowerCase();
+  const subcategory = (m.subcategory ?? '').trim().toLowerCase();
+  return (
+    category === 'quest' ||
+    category === 'quests' ||
+    category.includes('quest') ||
+    subcategory.includes('quest')
+  );
+}
+
 export function LeafletMapView({ mapId = 'dam' }: Props) {
   const webViewRef = useRef<WebView>(null);
   const [markers, setMarkers] = useState<GameMapMarker[]>([]);
@@ -58,7 +69,8 @@ export function LeafletMapView({ mapId = 'dam' }: Props) {
     setMarkersLoading(true);
     fetchMapMarkersCached(mapId)
       .then((data) => {
-        if (!cancelled) setMarkers(data);
+        if (cancelled) return;
+        setMarkers(data.filter(isQuestMarker));
       })
       .finally(() => {
         if (!cancelled) setMarkersLoading(false);

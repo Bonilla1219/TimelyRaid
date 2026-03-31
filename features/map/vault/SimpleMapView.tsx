@@ -5,30 +5,31 @@
  * VAULTED: Moved here for rollback. Use LeafletMapView for tile map.
  */
 
+import { fetchMapMarkersCached } from '@/features/map/markerCache';
 import type { GameMapMarker } from '@/features/map/metaforge';
 import {
-  getTileUrlsForZoom,
+  getTileUrlTemplate,
   SIMPLE_MAP_ZOOM,
   SOURCE_MAP_HEIGHT,
   SOURCE_MAP_WIDTH,
   TILE_SIZE,
-  ZOOM5_IMAGE_SIZE,
 } from '@/features/map/tileConfig';
 import { Image } from 'expo-image';
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
   Text,
   useWindowDimensions,
-  View,
+  View
 } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
   clamp,
+  interpolate,
   runOnJS,
+  type SharedValue,
   useAnimatedStyle,
   useSharedValue,
 } from 'react-native-reanimated';
@@ -36,8 +37,20 @@ import Animated, {
 const MAX_SCALE = 4;
 const MARKER_RADIUS = 6;
 
-/** Logical size for marker coords: zoom-5 stitched map (32×256 = 8192). */
-const MAP_LOGICAL_SIZE = ZOOM5_IMAGE_SIZE;
+const MARKER_RADIUS_SCREEN_ZOOMED_OUT = 8;
+const MARKER_RADIUS_SCREEN_ZOOMED_IN = 6;
+
+/**
+ * Trimmed zoom-5 stitched tile bounds (inclusive) to remove transparent edge tiles.
+ * Current known meaningful content area: x=0..28, y=0..18.
+ */
+const TRIM_MIN_TILE_X = 0;
+const TRIM_MAX_TILE_X = 28;
+const TRIM_MIN_TILE_Y = 0;
+const TRIM_MAX_TILE_Y = 18;
+
+const MAP_LOGICAL_WIDTH = (TRIM_MAX_TILE_X - TRIM_MIN_TILE_X + 1) * TILE_SIZE; // 7424
+const MAP_LOGICAL_HEIGHT = (TRIM_MAX_TILE_Y - TRIM_MIN_TILE_Y + 1) * TILE_SIZE; // 4864
 
 type MapMarker = GameMapMarker & { x: number; y: number };
 
@@ -45,45 +58,51 @@ type Props = {
   mapId?: string;
 };
 
-const ALL_CATEGORIES = 'All';
+function MarkerDot({
+  scale,
+  minScale,
+}: {
+  scale: SharedValue<number>;
+  minScale: SharedValue<number>;
+}) {
+  const dotStyle = useAnimatedStyle(() => {
+    const s = Math.max(0.0001, scale.value);
+    const minS = Math.max(0.0001, minScale.value);
+    const denom = Math.max(0.0001, MAX_SCALE - minS);
+    const t = clamp((s - minS) / denom, 0, 1);
 
-/** Test markers for debugging placement. */
-const TEST_MARKERS: GameMapMarker[] = [
-  {
-    id: '80f8c40f-33cd-bf23-f878-95570edaf386',
-    mapID: 'dam',
-    category: '',
-    subcategory: 'untended-garden',
-    lat: 1991.487410463,
-    lng: 3998.75,
-    instanceName: '',
-    behindLockedDoor: false,
-    lootAreas: null,
-    zlayers: null,
-    eventConditionMask: null,
-    updated_at: '',
-  },
-  {
-    id: '5b5b99b3-20d8-5817-6a79-8157fa536ea1',
-    mapID: 'dam',
-    category: '',
-    subcategory: 'untended-garden',
-    lat: 1916.40293036322,
-    lng: 3767.21594033664,
-    instanceName: '',
-    behindLockedDoor: false,
-    lootAreas: null,
-    zlayers: null,
-    eventConditionMask: null,
-    updated_at: '',
-  },
-];
+    // Desired radius in SCREEN pixels: big when zoomed out, small when zoomed in.
+    const rScreen = interpolate(
+      t,
+      [0, 1],
+      [MARKER_RADIUS_SCREEN_ZOOMED_OUT, MARKER_RADIUS_SCREEN_ZOOMED_IN]
+    );
+
+    // Convert to MAP-space radius so that after parent scale transform,
+    // the on-screen radius matches rScreen.
+    const rMap = rScreen / s;
+    const d = rMap * 2;
+
+    return {
+      width: d,
+      height: d,
+      borderRadius: rMap,
+      transform: [{ translateX: -rMap }, { translateY: -rMap }],
+    };
+  });
+
+  return <Animated.View style={[styles.markerDot, dotStyle]} />;
+}
 
 export function SimpleMapView({ mapId = 'dam' }: Props) {
-  const [markers] = useState<GameMapMarker[]>(TEST_MARKERS);
-  const [markersLoading] = useState(false);
-  const [markersError] = useState<string | null>(null);
+  const [markers, setMarkers] = useState<GameMapMarker[]>([]);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+  const [eventsExpanded, setEventsExpanded] = useState(false);
+  const [selectedEventSubcategories, setSelectedEventSubcategories] = useState<string[]>([]);
+  const [containersExpanded, setContainersExpanded] = useState(false);
+  const [selectedContainerSubcategories, setSelectedContainerSubcategories] = useState<
+    string[]
+  >([]);
   const [crosshairLabel, setCrosshairLabel] = useState('x=0 y=0 | tile 0,0');
 
   const { width: windowWidth, height: windowHeight } = useWindowDimensions();
@@ -92,15 +111,36 @@ export function SimpleMapView({ mapId = 'dam' }: Props) {
     height: number;
   } | null>(null);
 
-  /** Stitched map size in px (zoom 5: 32×256 = 8192). */
-  const mapSize = MAP_LOGICAL_SIZE;
+  useEffect(() => {
+    if (!mapId) return;
+    let cancelled = false;
+
+    fetchMapMarkersCached(mapId)
+      .then((data) => {
+        if (cancelled) return;
+        setMarkers(data);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setMarkers([]);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mapId]);
+
+  /** Trimmed stitched map size in px for marker/tap coordinate space. */
+  const mapWidth = MAP_LOGICAL_WIDTH;
+  const mapHeight = MAP_LOGICAL_HEIGHT;
 
   const fillScale = useMemo(() => {
     if (!mapContainerSize) return 1;
     const w = mapContainerSize.width;
     const h = mapContainerSize.height;
-    return Math.max(w, h) / mapSize;
-  }, [mapContainerSize, mapSize]);
+    // Scale so the trimmed map fills the container (letterboxing avoided).
+    return Math.max(w / mapWidth, h / mapHeight);
+  }, [mapContainerSize, mapWidth, mapHeight]);
 
   const categories = useMemo(() => {
     const set = new Set<string>();
@@ -111,10 +151,43 @@ export function SimpleMapView({ mapId = 'dam' }: Props) {
     return Array.from(set).sort();
   }, [markers]);
 
+  const eventSubcategories = useMemo(() => {
+    const set = new Set<string>();
+    markers.forEach((m) => {
+      const c = (m.category ?? '').trim().toLowerCase();
+      if (c !== 'events') return;
+      const sub = (m.subcategory ?? '').trim();
+      if (sub) set.add(sub);
+    });
+    return Array.from(set).sort();
+  }, [markers]);
+
+  const containerSubcategories = useMemo(() => {
+    const set = new Set<string>();
+    markers.forEach((m) => {
+      const c = (m.category ?? '').trim().toLowerCase();
+      if (c !== 'containers') return;
+      const sub = (m.subcategory ?? '').trim();
+      if (sub) set.add(sub);
+    });
+    return Array.from(set).sort();
+  }, [markers]);
+
+  // Default to a single category (no "All"): pick Quests if present, else first available.
+  useEffect(() => {
+    if (selectedCategory != null) return;
+    if (categories.length === 0) return;
+    const preferred =
+      categories.find((c) => c.toLowerCase() === 'quests') ??
+      categories.find((c) => c.toLowerCase() === 'quest') ??
+      categories[0];
+    setSelectedCategory(preferred);
+  }, [categories, selectedCategory]);
+
   const mapMarkers = useMemo((): MapMarker[] => {
     if (markers.length === 0) return [];
-    const displayWidth = MAP_LOGICAL_SIZE;
-    const displayHeight = MAP_LOGICAL_SIZE;
+    const displayWidth = mapWidth;
+    const displayHeight = mapHeight;
     return markers.map((m) => {
       const x =
         SOURCE_MAP_WIDTH > 0
@@ -126,18 +199,55 @@ export function SimpleMapView({ mapId = 'dam' }: Props) {
           : 0;
       return { ...m, x, y };
     });
-  }, [markers]);
+  }, [markers, mapWidth, mapHeight]);
 
   const filteredMapMarkers = useMemo((): MapMarker[] => {
-    if (!selectedCategory || selectedCategory === ALL_CATEGORIES)
-      return mapMarkers;
-    return mapMarkers.filter((m) => m.category === selectedCategory);
-  }, [mapMarkers, selectedCategory]);
+    if (!selectedCategory) return [];
 
-  const tileUrls = useMemo(
-    () => getTileUrlsForZoom(mapId, SIMPLE_MAP_ZOOM),
-    [mapId]
-  );
+    const selected = selectedCategory.trim().toLowerCase();
+
+    if (selected === 'events') {
+      if (selectedEventSubcategories.length === 0) return [];
+      const allow = new Set(selectedEventSubcategories);
+      return mapMarkers.filter(
+        (m) =>
+          (m.category ?? '').trim().toLowerCase() === 'events' &&
+          allow.has((m.subcategory ?? '').trim())
+      );
+    }
+
+    if (selected === 'containers') {
+      if (selectedContainerSubcategories.length === 0) return [];
+      const allow = new Set(selectedContainerSubcategories);
+      return mapMarkers.filter(
+        (m) =>
+          (m.category ?? '').trim().toLowerCase() === 'containers' &&
+          allow.has((m.subcategory ?? '').trim())
+      );
+    }
+
+    return mapMarkers.filter((m) => m.category === selectedCategory);
+  }, [
+    mapMarkers,
+    selectedCategory,
+    selectedEventSubcategories,
+    selectedContainerSubcategories,
+  ]);
+
+  const tileUrlTemplate = useMemo(() => getTileUrlTemplate(mapId), [mapId]);
+  const tileUrls = useMemo(() => {
+    const tiles: Array<{ x: number; y: number; url: string }> = [];
+    for (let x = TRIM_MIN_TILE_X; x <= TRIM_MAX_TILE_X; x++) {
+      for (let y = TRIM_MIN_TILE_Y; y <= TRIM_MAX_TILE_Y; y++) {
+        const url = tileUrlTemplate
+          .replace('{z}', String(SIMPLE_MAP_ZOOM))
+          .replace('{x}', String(x))
+          .replace('{y}', String(y));
+        tiles.push({ x, y, url });
+      }
+    }
+    return tiles;
+  }, [tileUrlTemplate]);
   const scale = useSharedValue(fillScale);
   const savedScale = useSharedValue(fillScale);
   const minScale = useSharedValue(fillScale);
@@ -145,6 +255,10 @@ export function SimpleMapView({ mapId = 'dam' }: Props) {
   const translateY = useSharedValue(0);
   const savedTranslateX = useSharedValue(0);
   const savedTranslateY = useSharedValue(0);
+  // Pinch anchoring state: keeps the zoom centered on the gesture focal point.
+  const pinchStartScale = useSharedValue(fillScale);
+  const pinchSavedTranslateX = useSharedValue(0);
+  const pinchSavedTranslateY = useSharedValue(0);
   const containerW = useSharedValue(windowWidth);
   const containerH = useSharedValue(windowHeight);
   const crosshairScreenX = useSharedValue(windowWidth / 2);
@@ -156,20 +270,22 @@ export function SimpleMapView({ mapId = 'dam' }: Props) {
       setMapContainerSize({ width, height });
       containerW.value = width;
       containerH.value = height;
-      if (width > 0 && height > 0 && mapSize > 0) {
-        const fitScale = Math.max(width, height) / mapSize;
+      if (width > 0 && height > 0 && mapWidth > 0 && mapHeight > 0) {
+        const fitScale = Math.max(width / mapWidth, height / mapHeight);
         minScale.value = fitScale;
         scale.value = fitScale;
         savedScale.value = fitScale;
       }
     },
-    [containerW, containerH, minScale, scale, savedScale, mapSize]
+    [containerW, containerH, minScale, scale, savedScale, mapWidth, mapHeight]
   );
 
   const updateCrosshairLabel = useCallback((x: number, y: number) => {
-    const tileX = Math.floor(x / TILE_SIZE);
-    const tileY = Math.floor(y / TILE_SIZE);
-    setCrosshairLabel(`x=${Math.round(x)} y=${Math.round(y)} | tile ${tileX},${tileY}`);
+    const tileX = Math.floor(x / TILE_SIZE) + TRIM_MIN_TILE_X;
+    const tileY = Math.floor(y / TILE_SIZE) + TRIM_MIN_TILE_Y;
+    setCrosshairLabel(
+      `x=${Math.round(x)} y=${Math.round(y)} | tile ${tileX},${tileY}`
+    );
   }, []);
 
   const tapGesture = Gesture.Tap()
@@ -178,22 +294,57 @@ export function SimpleMapView({ mapId = 'dam' }: Props) {
       crosshairScreenX.value = e.x;
       crosshairScreenY.value = e.y;
 
-      // e.x, e.y are in the gesture target's local coords (same 8192×8192 map space as markers).
-      const cx = Math.max(0, Math.min(mapSize, e.x));
-      const cy = Math.max(0, Math.min(mapSize, e.y));
+      // e.x, e.y are in the gesture target's local coords (same trimmed map space as markers).
+      const cx = Math.max(0, Math.min(mapWidth, e.x));
+      const cy = Math.max(0, Math.min(mapHeight, e.y));
       runOnJS(updateCrosshairLabel)(cx, cy);
     });
 
   const pinchGesture = Gesture.Pinch()
+    .onBegin(() => {
+      pinchStartScale.value = scale.value;
+      pinchSavedTranslateX.value = translateX.value;
+      pinchSavedTranslateY.value = translateY.value;
+    })
     .onUpdate((e) => {
-      scale.value = clamp(
-        savedScale.value * e.scale,
+      const nextScale = clamp(
+        pinchStartScale.value * e.scale,
         minScale.value,
         MAX_SCALE
       );
+
+      // `focalX/Y` are in the gesture target's local coords (same space as markers).
+      const focalX = clamp(e.focalX, 0, mapWidth);
+      const focalY = clamp(e.focalY, 0, mapHeight);
+
+      const deltaScale = nextScale - pinchStartScale.value;
+
+      // translate is applied after scale (see `animatedStyle` transform order),
+      // so the adjustment below keeps the focal point visually stationary.
+      const w = containerW.value;
+      const h = containerH.value;
+      const scaledMapW = mapWidth * nextScale;
+      const scaledMapH = mapHeight * nextScale;
+      const maxTx = Math.max(0, (scaledMapW - w) / 2);
+      const maxTy = Math.max(0, (scaledMapH - h) / 2);
+
+      translateX.value = clamp(
+        pinchSavedTranslateX.value + deltaScale * (mapWidth / 2 - focalX),
+        -maxTx,
+        maxTx
+      );
+      translateY.value = clamp(
+        pinchSavedTranslateY.value + deltaScale * (mapHeight / 2 - focalY),
+        -maxTy,
+        maxTy
+      );
+
+      scale.value = nextScale;
     })
     .onEnd(() => {
       savedScale.value = scale.value;
+      savedTranslateX.value = translateX.value;
+      savedTranslateY.value = translateY.value;
     });
 
   const panGesture = Gesture.Pan()
@@ -201,8 +352,8 @@ export function SimpleMapView({ mapId = 'dam' }: Props) {
       const w = containerW.value;
       const h = containerH.value;
       const s = scale.value;
-      const scaledMapW = mapSize * s;
-      const scaledMapH = mapSize * s;
+      const scaledMapW = mapWidth * s;
+      const scaledMapH = mapHeight * s;
       const maxTx = Math.max(0, (scaledMapW - w) / 2);
       const maxTy = Math.max(0, (scaledMapH - h) / 2);
       translateX.value = clamp(
@@ -227,15 +378,15 @@ export function SimpleMapView({ mapId = 'dam' }: Props) {
     const w = containerW.value;
     const h = containerH.value;
     const s = scale.value;
-    const scaledMapW = mapSize * s;
-    const scaledMapH = mapSize * s;
+    const scaledMapW = mapWidth * s;
+    const scaledMapH = mapHeight * s;
     const maxTx = Math.max(0, (scaledMapW - w) / 2);
     const maxTy = Math.max(0, (scaledMapH - h) / 2);
     return {
       transform: [
+        { scale: scale.value },
         { translateX: clamp(translateX.value, -maxTx, maxTx) },
         { translateY: clamp(translateY.value, -maxTy, maxTy) },
-        { scale: scale.value },
       ],
     };
   });
@@ -247,7 +398,8 @@ export function SimpleMapView({ mapId = 'dam' }: Props) {
     };
   });
 
-  const maxPos = mapSize - MARKER_RADIUS * 2;
+  const maxXPos = mapWidth - MARKER_RADIUS * 2;
+  const maxYPos = mapHeight - MARKER_RADIUS * 2;
 
   return (
     <View style={styles.container} collapsable={false}>
@@ -268,7 +420,7 @@ export function SimpleMapView({ mapId = 'dam' }: Props) {
               <Animated.View
                 style={[
                   styles.mapWrap,
-                  { width: mapSize, height: mapSize },
+                  { width: mapWidth, height: mapHeight },
                   animatedStyle,
                 ]}
               >
@@ -283,18 +435,23 @@ export function SimpleMapView({ mapId = 'dam' }: Props) {
                 </View>
                 <View style={styles.mapSizeBadge} pointerEvents="none">
                   <Text style={styles.mapSizeBadgeText}>
-                    {MAP_LOGICAL_SIZE}×{MAP_LOGICAL_SIZE}px
+                    {MAP_LOGICAL_WIDTH}×{MAP_LOGICAL_HEIGHT}px
                   </Text>
                 </View>
-                <View style={[styles.tileGrid, { width: mapSize, height: mapSize }]}>
+                <View
+                  style={[
+                    styles.tileGrid,
+                    { width: mapWidth, height: mapHeight },
+                  ]}
+                >
                   {tileUrls.map((tile) => (
                     <Image
                       key={`${tile.x}-${tile.y}`}
                       source={{ uri: tile.url }}
                       style={{
                         position: 'absolute',
-                        left: tile.x * TILE_SIZE,
-                        top: tile.y * TILE_SIZE,
+                        left: (tile.x - TRIM_MIN_TILE_X) * TILE_SIZE,
+                        top: (tile.y - TRIM_MIN_TILE_Y) * TILE_SIZE,
                         width: TILE_SIZE,
                         height: TILE_SIZE,
                       }}
@@ -305,35 +462,24 @@ export function SimpleMapView({ mapId = 'dam' }: Props) {
                 <View
                   style={[
                     styles.markerOverlay,
-                    { width: mapSize, height: mapSize },
+                    { width: mapWidth, height: mapHeight },
                   ]}
                   pointerEvents="box-none"
                 >
                   {filteredMapMarkers.map((m) => {
-                    const viewX = (m.x / MAP_LOGICAL_SIZE) * mapSize;
-                    const viewY = (m.y / MAP_LOGICAL_SIZE) * mapSize;
-                    const left = Math.max(0, Math.min(maxPos, viewX - MARKER_RADIUS));
-                    const top = Math.max(0, Math.min(maxPos, viewY - MARKER_RADIUS));
+                    const left = Math.max(0, Math.min(maxXPos, m.x));
+                    const top = Math.max(0, Math.min(maxYPos, m.y));
                     return (
                       <View
                         key={m.id}
                         style={[styles.markerWrapper, { left, top }]}
                       >
-                        <View
-                          style={[
-                            styles.markerDot,
-                            {
-                              width: MARKER_RADIUS * 2,
-                              height: MARKER_RADIUS * 2,
-                              borderRadius: MARKER_RADIUS,
-                            },
-                          ]}
-                        />
-                        <View style={styles.markerCoordBox}>
+                        <MarkerDot scale={scale} minScale={minScale} />
+                        {/*<View style={styles.markerCoordBox}>
                           <Text style={styles.markerCoordText}>
                             x: {Math.round(m.x)}, y: {Math.round(m.y)}
-                          </Text>
-                        </View>
+                          </Text>*/}
+                        {/*</View>*/}
                       </View>
                     );
                   })}
@@ -344,52 +490,122 @@ export function SimpleMapView({ mapId = 'dam' }: Props) {
         </View>
       </View>
       <View style={styles.bottomSection}>
-        <ScrollView
-          horizontal
-          style={styles.chipScroll}
-          contentContainerStyle={styles.chipScrollContent}
-          showsHorizontalScrollIndicator={false}
-        >
-          <Pressable
-            style={[
-              styles.chip,
-              selectedCategory === null || selectedCategory === ALL_CATEGORIES
-                ? styles.chipSelected
-                : undefined,
-            ]}
-            onPress={() => setSelectedCategory(null)}
+        <View style={styles.filterStack}>
+          <ScrollView
+            horizontal
+            style={styles.chipScroll}
+            contentContainerStyle={styles.chipScrollContent}
+            showsHorizontalScrollIndicator={false}
           >
-            <Text
-              style={[
-                styles.chipText,
-                selectedCategory === null || selectedCategory === ALL_CATEGORIES
-                  ? styles.chipTextSelected
-                  : undefined,
-              ]}
+            {categories.map((cat) => {
+              const selected = selectedCategory === cat;
+              const isEvents = cat.trim().toLowerCase() === 'events';
+              const isContainers = cat.trim().toLowerCase() === 'containers';
+              return (
+                <Pressable
+                  key={cat}
+                  style={[styles.chip, selected ? styles.chipSelected : undefined]}
+                  onPress={() => {
+                    setSelectedCategory(cat);
+                    if (!isEvents) setEventsExpanded(false);
+                    if (!isContainers) setContainersExpanded(false);
+                    if (isEvents) setEventsExpanded((v) => !v);
+                    if (isContainers) setContainersExpanded((v) => !v);
+                  }}
+                >
+                  <Text
+                    style={[
+                      styles.chipText,
+                      selected ? styles.chipTextSelected : undefined,
+                    ]}
+                  >
+                    {isEvents ? 'Events' : isContainers ? 'Containers' : cat}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </ScrollView>
+
+          {(selectedCategory ?? '').trim().toLowerCase() === 'events' &&
+          eventsExpanded &&
+          eventSubcategories.length > 0 ? (
+            <ScrollView
+              horizontal
+              style={styles.subChipScroll}
+              contentContainerStyle={styles.subChipScrollContent}
+              showsHorizontalScrollIndicator={false}
             >
-              {ALL_CATEGORIES}
-            </Text>
-          </Pressable>
-          {categories.map((cat) => (
-            <Pressable
-              key={cat}
-              style={[
-                styles.chip,
-                selectedCategory === cat ? styles.chipSelected : undefined,
-              ]}
-              onPress={() => setSelectedCategory(cat)}
+              {eventSubcategories.map((sub) => {
+                const selected = selectedEventSubcategories.includes(sub);
+                return (
+                  <Pressable
+                    key={sub}
+                    style={[
+                      styles.subChip,
+                      selected ? styles.subChipSelected : undefined,
+                    ]}
+                    onPress={() => {
+                      setSelectedEventSubcategories((prev) => {
+                        if (prev.includes(sub)) return prev.filter((s) => s !== sub);
+                        return [...prev, sub];
+                      });
+                    }}
+                  >
+                    <Text
+                      style={[
+                        styles.subChipText,
+                        selected ? styles.subChipTextSelected : undefined,
+                      ]}
+                      numberOfLines={1}
+                    >
+                      {sub}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </ScrollView>
+          ) : null}
+
+          {(selectedCategory ?? '').trim().toLowerCase() === 'containers' &&
+          containersExpanded &&
+          containerSubcategories.length > 0 ? (
+            <ScrollView
+              horizontal
+              style={styles.subChipScroll}
+              contentContainerStyle={styles.subChipScrollContent}
+              showsHorizontalScrollIndicator={false}
             >
-              <Text
-                style={[
-                  styles.chipText,
-                  selectedCategory === cat ? styles.chipTextSelected : undefined,
-                ]}
-              >
-                {cat}
-              </Text>
-            </Pressable>
-          ))}
-        </ScrollView>
+              {containerSubcategories.map((sub) => {
+                const selected = selectedContainerSubcategories.includes(sub);
+                return (
+                  <Pressable
+                    key={sub}
+                    style={[
+                      styles.subChip,
+                      selected ? styles.subChipSelected : undefined,
+                    ]}
+                    onPress={() => {
+                      setSelectedContainerSubcategories((prev) => {
+                        if (prev.includes(sub)) return prev.filter((s) => s !== sub);
+                        return [...prev, sub];
+                      });
+                    }}
+                  >
+                    <Text
+                      style={[
+                        styles.subChipText,
+                        selected ? styles.subChipTextSelected : undefined,
+                      ]}
+                      numberOfLines={1}
+                    >
+                      {sub}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </ScrollView>
+          ) : null}
+        </View>
       </View>
     </View>
   );
@@ -410,6 +626,9 @@ const styles = StyleSheet.create({
     backgroundColor: '#1a1a1a',
     justifyContent: 'center',
     paddingVertical: 12,
+  },
+  filterStack: {
+    gap: 10,
   },
   chipScroll: {
     flexGrow: 0,
@@ -438,6 +657,33 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontWeight: '600',
   },
+  subChipScroll: {
+    flexGrow: 0,
+  },
+  subChipScrollContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    gap: 8,
+  },
+  subChip: {
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 16,
+    backgroundColor: 'rgba(255,255,255,0.10)',
+    maxWidth: 220,
+  },
+  subChipSelected: {
+    backgroundColor: 'rgba(74, 158, 255, 0.35)',
+  },
+  subChipText: {
+    fontSize: 13,
+    color: '#bbb',
+  },
+  subChipTextSelected: {
+    color: '#fff',
+    fontWeight: '600',
+  },
   mapContainer: {
     width: '100%',
     aspectRatio: 3/4,
@@ -454,8 +700,8 @@ const styles = StyleSheet.create({
   },
   mapWrap: {
     overflow: 'hidden',
-    borderWidth: 2,
-    borderColor: 'green',
+    borderWidth: 20,
+    borderColor: 'orange',
   },
   crosshairOverlay: {
     position: 'absolute',
@@ -527,7 +773,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 6,
   },
-  markerCoordBox: {
+  /*markerCoordBox: {
     paddingHorizontal: 6,
     paddingVertical: 2,
     backgroundColor: 'rgba(0,0,0,0.7)',
@@ -538,7 +784,7 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 11,
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-  },
+  },*/
   markerDot: {
     position: 'absolute',
     backgroundColor: 'rgba(74, 158, 255, 0.9)',

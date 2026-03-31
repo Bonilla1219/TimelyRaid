@@ -30,8 +30,8 @@ export const ZOOM_GRIDS: Record<number, { maxX: number; maxY: number }> = {
 };
 
 /** Source map dimensions in MetaForge coordinate space; markers lat/lng are in this range. */
-export const SOURCE_MAP_WIDTH = 4800;
-export const SOURCE_MAP_HEIGHT = 5175;
+export const SOURCE_MAP_WIDTH = 8050;
+export const SOURCE_MAP_HEIGHT = 5270;
 
 /** Tile grid at z=2: 4×3 (x: 0–3, y: 0–2). Fallback when zoom not in ZOOM_GRIDS. */
 export const TILE_GRID_WIDTH = 4;
